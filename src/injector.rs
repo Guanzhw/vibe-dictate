@@ -12,7 +12,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 pub fn clipboard_paste(text: &str) -> Result<()> {
     let mut clipboard = Clipboard::new().context("clipboard open")?;
     let previous = clipboard.get_text().ok();
-    clipboard.set_text(text.to_string()).context("set clipboard")?;
+    clipboard
+        .set_text(text.to_string())
+        .context("set clipboard")?;
     send_ctrl_v()?;
     // Give the target app a moment to consume the clipboard before restoring
     thread::sleep(Duration::from_millis(120));
@@ -59,7 +61,13 @@ pub fn send_input_text(text: &str, key_delay_ms: u64, key_down_delay_ms: u64) ->
                 down.len(),
                 err
             );
-            break;
+            return Err(anyhow::anyhow!(
+                "SendInput key-down failed for U+{:04X}: {}/{} (err {:?})",
+                ch,
+                n_down,
+                down.len(),
+                err
+            ));
         }
         if key_down_delay_ms > 0 {
             thread::sleep(Duration::from_millis(key_down_delay_ms));
@@ -71,8 +79,20 @@ pub fn send_input_text(text: &str, key_delay_ms: u64, key_down_delay_ms: u64) ->
         sent_events += n_up;
         if (n_up as usize) < up.len() {
             let err = unsafe { GetLastError() };
-            log::warn!("SendInput up partial on U+{:04X}: {}/{} (err {:?})", ch, n_up, up.len(), err);
-            break;
+            log::warn!(
+                "SendInput up partial on U+{:04X}: {}/{} (err {:?})",
+                ch,
+                n_up,
+                up.len(),
+                err
+            );
+            return Err(anyhow::anyhow!(
+                "SendInput key-up failed for U+{:04X}: {}/{} (err {:?})",
+                ch,
+                n_up,
+                up.len(),
+                err
+            ));
         }
 
         // Pace between characters. Spaces get an extra dose because
@@ -107,8 +127,15 @@ fn send_ctrl_v() -> Result<()> {
         make_vk_input(VK_V, true),
         make_vk_input(VK_CONTROL, true),
     ];
-    unsafe {
-        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+    let n = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    if n as usize != inputs.len() {
+        let err = unsafe { GetLastError() };
+        return Err(anyhow::anyhow!(
+            "SendInput Ctrl+V failed: {}/{} events (err {:?})",
+            n,
+            inputs.len(),
+            err
+        ));
     }
     Ok(())
 }
@@ -126,7 +153,18 @@ pub fn send_enter() -> Result<()> {
     let n = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
     if (n as usize) < inputs.len() {
         let err = unsafe { GetLastError() };
-        log::warn!("SendInput VK_RETURN dropped ({}/{} events, err {:?})", n, inputs.len(), err);
+        log::warn!(
+            "SendInput VK_RETURN dropped ({}/{} events, err {:?})",
+            n,
+            inputs.len(),
+            err
+        );
+        return Err(anyhow::anyhow!(
+            "SendInput Return failed: {}/{} events (err {:?})",
+            n,
+            inputs.len(),
+            err
+        ));
     }
     Ok(())
 }

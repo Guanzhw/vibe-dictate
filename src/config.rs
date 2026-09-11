@@ -37,6 +37,10 @@ pub struct Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
+    /// Transport used for transcription. Streaming speaks the local
+    /// VibeVoice websocket protocol; HTTP preserves the existing API path.
+    #[serde(default)]
+    pub backend: BackendMode,
     /// Base URL of the OpenAI-compatible STT server, e.g.
     /// `http://localhost:8080` or `https://stt.example.com`. No trailing
     /// slash. The client appends `/v1/audio/transcriptions`.
@@ -76,11 +80,25 @@ pub const DEFAULT_API_KEY: &str = "vibe-dictate-default-change-me";
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            backend: BackendMode::Http,
             base_url: "http://localhost:8080".to_string(),
             api_key: DEFAULT_API_KEY.to_string(),
             model: default_stt_model(),
             extra_ca_cert: String::new(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendMode {
+    Http,
+    Streaming,
+}
+
+impl Default for BackendMode {
+    fn default() -> Self {
+        Self::Http
     }
 }
 
@@ -159,8 +177,7 @@ impl Default for HotkeyConfig {
     }
 }
 
-pub const HOTKEY_OPTIONS: &[&str] =
-    &["F7", "F8", "F9", "F10", "F11", "F12", "Pause", "ScrollLock"];
+pub const HOTKEY_OPTIONS: &[&str] = &["F7", "F8", "F9", "F10", "F11", "F12", "Pause", "ScrollLock"];
 
 /// Toggle between push-to-talk (hold hotkey/mouse button) and voice
 /// activation (continuous mic listening with an RMS-based VAD). The
@@ -220,12 +237,24 @@ pub struct VadConfig {
     pub noise_floor_min: f32,
 }
 
-fn default_vad_start_frames() -> u32 { 3 }
-fn default_vad_end_frames() -> u32 { 35 }
-fn default_vad_max_seconds() -> u32 { 30 }
-fn default_vad_min_utt_ms() -> u32 { 300 }
-fn default_vad_speech_ratio() -> f32 { 3.0 }
-fn default_vad_noise_floor_min() -> f32 { 80.0 }
+fn default_vad_start_frames() -> u32 {
+    3
+}
+fn default_vad_end_frames() -> u32 {
+    35
+}
+fn default_vad_max_seconds() -> u32 {
+    30
+}
+fn default_vad_min_utt_ms() -> u32 {
+    300
+}
+fn default_vad_speech_ratio() -> f32 {
+    3.0
+}
+fn default_vad_noise_floor_min() -> f32 {
+    80.0
+}
 
 impl Default for VadConfig {
     fn default() -> Self {
@@ -274,9 +303,15 @@ pub struct OutputConfig {
     pub interactive_keystrokes: bool,
 }
 
-fn default_send_key_delay_ms() -> u64 { 30 }
-fn default_send_key_down_delay_ms() -> u64 { 15 }
-fn default_interactive_keystrokes() -> bool { true }
+fn default_send_key_delay_ms() -> u64 {
+    30
+}
+fn default_send_key_down_delay_ms() -> u64 {
+    15
+}
+fn default_interactive_keystrokes() -> bool {
+    true
+}
 
 impl Default for OutputConfig {
     fn default() -> Self {
@@ -354,10 +389,9 @@ impl Config {
             log::info!("Created default config at {}", path.display());
             return Ok(cfg);
         }
-        let text = fs::read_to_string(&path)
-            .with_context(|| format!("Read {}", path.display()))?;
-        let mut cfg: Config = toml::from_str(&text)
-            .with_context(|| format!("Parse {}", path.display()))?;
+        let text = fs::read_to_string(&path).with_context(|| format!("Read {}", path.display()))?;
+        let mut cfg: Config =
+            toml::from_str(&text).with_context(|| format!("Parse {}", path.display()))?;
         log::info!("Loaded config from {}", path.display());
         if cfg.migrate_in_place() {
             cfg.save()?;
@@ -371,12 +405,9 @@ impl Config {
         // Alt-based hotkeys conflict with Windows app menus and AltGr (RightAlt = Ctrl+Alt
         // on Hungarian layouts) tends to leave Alt stuck. Force-migrate to F8 default.
         let lower = self.hotkey.binding.to_ascii_lowercase();
-        let has_alt = lower.split('+').any(|t| {
-            matches!(
-                t.trim(),
-                "alt" | "rightalt" | "altgr" | "leftalt"
-            )
-        });
+        let has_alt = lower
+            .split('+')
+            .any(|t| matches!(t.trim(), "alt" | "rightalt" | "altgr" | "leftalt"));
         if has_alt {
             log::warn!(
                 "Migrating Alt-based hotkey '{}' to 'F8' (Alt conflicts with app menus)",

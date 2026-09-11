@@ -26,6 +26,7 @@ windows = { version = "0.58", features = [
     "Win32_Security",
     "Win32_System_LibraryLoader",
     "Win32_Graphics_Gdi",
+    "Win32_UI_HiDpi",
 ] }
 
 # Audio capture (WASAPI via cpal)
@@ -63,6 +64,10 @@ env_logger = "0.11"
 anyhow = "1.0"
 once_cell = "1.20"
 crossbeam-channel = "0.5"
+
+# Local VibeVoice streaming transport. The installed client uses ws:// on
+# localhost; keep the legacy HTTP transport in reqwest above.
+tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 
 [build-dependencies]
 embed-resource = "3"

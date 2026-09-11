@@ -1,5 +1,17 @@
 # CLAUDE.md — vibe-dictate
 
+## Personal fork context
+
+This checkout is maintained at `https://github.com/Guanzhw/vibe-dictate`.
+The original project is `https://github.com/chestercs/vibe-dictate`.
+Use `git remote -v` to check the current remotes before publishing changes.
+Build and test the Windows client with `cargo build --release --locked`
+and `cargo test --locked`; see `docs/windows-streaming.md` for the local
+WSL streaming runtime. The notes below are retained from upstream and
+describe the original author's environment and workflow.
+
+## Original upstream notes
+
 Guidance for Claude Code sessions working on this project. Read this first
 when starting a new conversation in the `vibe-dictate/` repo root.
 

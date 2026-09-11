@@ -1,6 +1,6 @@
 /target
-Cargo.lock
 *.log
+__pycache__/
 
 # Generated at build time by build.rs when absent. Drop your own icon.ico
 # here to override the default blue-square-with-white-dot branding.

@@ -54,17 +54,19 @@ use tray_icon::menu::MenuEvent;
 mod audio;
 mod autostart;
 mod config;
-mod openai;
 mod hotkey_capture;
 mod injector;
 mod keystroke;
 mod mouse_hook;
+mod openai;
+mod overlay;
 mod singleton;
+mod streaming;
 mod text_input;
 mod tray;
 mod vad;
 
-use config::{Config, InputMode, OutputMode};
+use config::{BackendMode, Config, InputMode, OutputMode};
 
 #[derive(Debug, Clone)]
 enum AppEvent {
@@ -104,8 +106,8 @@ impl BindingManager {
             *self.mouse_shared.lock().unwrap() = Some(mb);
             log::info!("Binding active (mouse): {}", binding);
         } else {
-            let hk = parse_hotkey(binding)
-                .with_context(|| format!("parse hotkey '{}'", binding))?;
+            let hk =
+                parse_hotkey(binding).with_context(|| format!("parse hotkey '{}'", binding))?;
             self.kb_manager
                 .register(hk)
                 .with_context(|| format!("register hotkey '{}'", binding))?;
@@ -130,6 +132,105 @@ fn main() -> Result<()> {
     log::info!("vibe-dictate v{} starting", env!("CARGO_PKG_VERSION"));
     if let Ok(p) = Config::log_path() {
         log::info!("Log file: {}", p.display());
+    }
+
+    // Headless transport smoke path. It uses the same websocket/resampler
+    // code as PTT and is intentionally opt-in for injection so automated
+    // checks can prove model latency without touching the focused app.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--preview-overlay") {
+        run_overlay_preview();
+        return Ok(());
+    }
+    if let Some(file) = args
+        .iter()
+        .position(|arg| arg == "--transcribe-file")
+        .and_then(|i| args.get(i + 1))
+    {
+        let cfg = Config::load_or_default()?;
+        let realtime = args.iter().any(|arg| arg == "--realtime");
+        let inject = args.iter().any(|arg| arg == "--inject");
+        let preview = args.iter().any(|arg| arg == "--preview");
+        let result = if preview {
+            let (event_tx, event_rx) = crossbeam_channel::bounded(64);
+            let overlay = overlay::Overlay::start();
+            overlay.show_processing(None);
+            let server = cfg.server.clone();
+            let stt = cfg.stt.clone();
+            let path = file.clone();
+            let worker = thread::spawn(move || {
+                streaming::transcribe_file(&path, server, stt, realtime, Some(event_tx))
+            });
+            while !worker.is_finished() {
+                while let Ok(event) = event_rx.try_recv() {
+                    match event {
+                        streaming::StreamEvent::Partial(text) => {
+                            overlay.show_partial(&text);
+                        }
+                        streaming::StreamEvent::Done(_) => {}
+                        streaming::StreamEvent::Error(message) => {
+                            log::error!("streaming preview failed: {message}");
+                            overlay.hide();
+                        }
+                        streaming::StreamEvent::Cancelled => overlay.hide(),
+                    }
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            let result = worker
+                .join()
+                .map_err(|_| anyhow!("streaming preview worker panicked"))?;
+            overlay.hide();
+            result
+        } else {
+            streaming::transcribe_file(
+                file,
+                cfg.server.clone(),
+                cfg.stt.clone(),
+                realtime,
+                None,
+            )
+        };
+        match result {
+            Ok(result) => {
+                println!("{}", serde_json::to_string(&result)?);
+                if inject {
+                    let output_cfg = cfg.output;
+                    let text = result.clean_text.unwrap_or(result.text);
+                    let mut text = text.trim().to_string();
+                    if output_cfg.trailing_space {
+                        text.push(' ');
+                    }
+                    match output_cfg.mode {
+                        OutputMode::Clipboard => injector::clipboard_paste(&text)?,
+                        OutputMode::Sendinput => injector::send_input_text(
+                            &text,
+                            output_cfg.send_key_delay_ms,
+                            output_cfg.send_key_down_delay_ms,
+                        )?,
+                    }
+                    if output_cfg.send_enter {
+                        injector::send_enter()?;
+                    }
+                }
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    if let Some(pos) = args.iter().position(|arg| arg == "--record-seconds") {
+        let seconds = args
+            .get(pos + 1)
+            .ok_or_else(|| anyhow!("--record-seconds requires an integer from 1 to 15"))?
+            .parse::<u64>()
+            .context("parse --record-seconds")?;
+        if !(1..=15).contains(&seconds) {
+            return Err(anyhow!("--record-seconds must be between 1 and 15"));
+        }
+        let cfg = Config::load_or_default()?;
+        let result = streaming::record_seconds(&cfg.audio, cfg.server, cfg.stt, seconds)?;
+        println!("{}", serde_json::to_string(&result)?);
+        return Ok(());
     }
 
     let cfg = Arc::new(Mutex::new(Config::load_or_default()?));
@@ -196,6 +297,12 @@ fn main() -> Result<()> {
 
     // Recording state
     let recorder: Arc<Mutex<Option<audio::Recorder>>> = Arc::new(Mutex::new(None));
+    // Streaming PTT owns a live cpal stream while the key is held. The
+    // websocket worker and its bounded audio queue live in `StreamingCapture`.
+    let mut streaming_capture: Option<streaming::StreamingCapture> = None;
+    let mut streaming_events: Option<crossbeam_channel::Receiver<streaming::StreamEvent>> = None;
+    let streaming_partial: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let status_overlay = overlay::Overlay::start();
     let press_time: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
     // Double-tap detection state. `last_press_at` tracks the previous Pressed
     // timestamp (regardless of whether it was a single tap or the start of a
@@ -250,6 +357,8 @@ fn main() -> Result<()> {
     let connection_ok_loop = connection_ok.clone();
     let last_status_loop = last_status.clone();
     let vad_speech_active_loop = vad_speech_active.clone();
+    let streaming_partial_loop = streaming_partial.clone();
+    let status_overlay_loop = status_overlay.clone();
 
     // Keep tray + binding + mouse-hook state alive for the event loop.
     let tray_keep_alive = tray_state;
@@ -294,9 +403,13 @@ fn main() -> Result<()> {
         let last_error_note_hb = last_error_note.clone();
         thread::spawn(move || loop {
             let server_cfg = cfg_hb.lock().unwrap().server.clone();
-            let probe = openai::SttClient::new(&server_cfg)
-                .map_err(|e| e.to_string())
-                .and_then(|c| c.health_check().map_err(|e| e.short_summary()));
+            let probe = if server_cfg.backend == BackendMode::Streaming {
+                streaming::health_check(&server_cfg).map_err(|e| e.to_string())
+            } else {
+                openai::SttClient::new(&server_cfg)
+                    .map_err(|e| e.to_string())
+                    .and_then(|c| c.health_check().map_err(|e| e.short_summary()))
+            };
             match probe {
                 Ok(()) => {
                     let was_offline = !connection_ok_hb.swap(true, Ordering::SeqCst);
@@ -334,6 +447,9 @@ fn main() -> Result<()> {
 
         match event {
             tao::event::Event::UserEvent(AppEvent::Quit) => {
+                if let Some(capture) = streaming_capture.as_mut() {
+                    capture.cancel();
+                }
                 *control_flow = ControlFlow::Exit;
             }
             tao::event::Event::UserEvent(AppEvent::Tick) => {
@@ -361,7 +477,8 @@ fn main() -> Result<()> {
                         None => None,
                     }
                 };
-                let recording = recorder_loop.lock().unwrap().is_some();
+                let recording = recorder_loop.lock().unwrap().is_some()
+                    || streaming_capture.as_ref().map(|c| c.is_recording()).unwrap_or(false);
                 let vad_speaking = vad_speech_active_loop.load(Ordering::SeqCst);
                 let cancel_pending = cancel_flag_loop.load(Ordering::SeqCst);
                 let processing = !recording
@@ -372,6 +489,64 @@ fn main() -> Result<()> {
                     let c = cfg_loop.lock().unwrap();
                     (c.enabled, c.input.mode == InputMode::VoiceActivation)
                 };
+
+                // Streaming updates are drained on the UI thread. Partial
+                // text is deliberately only status feedback; exactly one
+                // injection happens after the final done message.
+                if let Some(rx) = streaming_events.as_ref() {
+                    while let Ok(evt) = rx.try_recv() {
+                        match evt {
+                            streaming::StreamEvent::Partial(partial) => {
+                                *streaming_partial_loop.lock().unwrap() = Some(partial.clone());
+                                log::debug!("streaming partial: {}", partial);
+                            }
+                            streaming::StreamEvent::Done(result) => {
+                                *streaming_partial_loop.lock().unwrap() = None;
+                                if cancel_flag_loop.swap(false, Ordering::SeqCst) {
+                                    log::info!("Streaming cancel honored, transcription discarded");
+                                    in_flight_loop.store(false, Ordering::SeqCst);
+                                    continue;
+                                }
+                                let cfg_clone = cfg_loop.clone();
+                                let conn_clone = connection_ok_loop.clone();
+                                let flash_err_clone = flash_error_until_loop.clone();
+                                let note_clone = last_error_note_loop.clone();
+                                let in_flight_output = in_flight_loop.clone();
+                                let run_cancel = streaming_capture
+                                    .as_ref()
+                                    .map(|capture| capture.cancel_token())
+                                    .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+                                thread::spawn(move || {
+                                    if let Err(e) = streaming_send_and_inject(
+                                        result,
+                                        cfg_clone,
+                                        conn_clone,
+                                        flash_err_clone,
+                                        note_clone,
+                                        in_flight_output,
+                                        run_cancel,
+                                    ) {
+                                        log::error!("Streaming output failed: {e:#}");
+                                    }
+                                });
+                            }
+                            streaming::StreamEvent::Error(msg) => {
+                                *streaming_partial_loop.lock().unwrap() = None;
+                                if let Some(capture) = streaming_capture.as_mut() {
+                                    capture.cancel();
+                                }
+                                in_flight_loop.store(false, Ordering::SeqCst);
+                                connection_ok_loop.store(false, Ordering::SeqCst);
+                                report_pipeline_error(&msg, true, &flash_error_until_loop, &last_error_note_loop);
+                            }
+                            streaming::StreamEvent::Cancelled => {
+                                *streaming_partial_loop.lock().unwrap() = None;
+                                in_flight_loop.store(false, Ordering::SeqCst);
+                                log::info!("Streaming session cancelled");
+                            }
+                        }
+                    }
+                }
 
                 // If a cancel is still pending on an in-flight transcription,
                 // keep the red flash instead of briefly flipping to yellow
@@ -399,10 +574,27 @@ fn main() -> Result<()> {
                 };
                 // Only surface the note when we have something relevant to
                 // say: any red/gray state, or idle with a still-fresh note.
+                let partial_note = streaming_partial_loop.lock().unwrap().clone();
+                let hotkey_label = cfg_loop.lock().unwrap().hotkey.binding.clone();
+                if recording {
+                    let elapsed = press_time_loop
+                        .lock()
+                        .unwrap()
+                        .map(|started| started.elapsed())
+                        .unwrap_or_default();
+                    status_overlay_loop.show_recording(
+                        &hotkey_label,
+                        elapsed,
+                        partial_note.as_deref(),
+                    );
+                } else if processing {
+                    status_overlay_loop.show_processing(partial_note.as_deref());
+                } else {
+                    status_overlay_loop.hide();
+                }
                 let tip_note = match desired {
-                    tray::TrayStatus::Recording
-                    | tray::TrayStatus::Processing
-                    | tray::TrayStatus::VadListening => None,
+                    tray::TrayStatus::Recording | tray::TrayStatus::Processing => partial_note,
+                    tray::TrayStatus::VadListening => None,
                     _ => note_text,
                 };
                 {
@@ -516,10 +708,18 @@ fn main() -> Result<()> {
                             let is_double_tap = prev
                                 .map(|t| now.duration_since(t) <= DOUBLE_TAP_WINDOW)
                                 .unwrap_or(false);
-                            let currently_recording =
-                                recorder_loop.lock().unwrap().is_some();
-                            let currently_in_flight =
-                                in_flight_loop.load(Ordering::SeqCst);
+                            let currently_in_flight = in_flight_loop.load(Ordering::SeqCst);
+                            if !currently_in_flight
+                                && streaming_capture
+                                    .as_ref()
+                                    .map(|c| !c.is_recording())
+                                    .unwrap_or(false)
+                            {
+                                streaming_capture = None;
+                                streaming_events = None;
+                            }
+                            let currently_recording = recorder_loop.lock().unwrap().is_some()
+                                || streaming_capture.as_ref().map(|c| c.is_recording()).unwrap_or(false);
 
                             // VAD mode has no PTT semantics — the hotkey only
                             // means "cancel whatever is currently running /
@@ -564,6 +764,11 @@ fn main() -> Result<()> {
 
                             if is_processing_cancel {
                                 cancel_flag_loop.store(true, Ordering::SeqCst);
+                                if let Some(capture) = streaming_capture.as_mut() {
+                                    if !capture.is_recording() {
+                                        capture.cancel();
+                                    }
+                                }
                                 *last_release_at_loop.lock().unwrap() = None;
                                 log::info!(
                                     "Fast-press cancel: in-flight transcription will be dropped"
@@ -584,30 +789,16 @@ fn main() -> Result<()> {
                                         PROCESSING_CANCEL_WINDOW.as_millis(),
                                     );
                                 }
-                                // Fall through to the "new session" branch.
-                                let mut slot = recorder_loop.lock().unwrap();
-                                if slot.is_none() {
-                                    cancel_flag_loop.store(false, Ordering::SeqCst);
-                                    *flash_until_loop.lock().unwrap() = None;
-                                    let audio_cfg = cfg_loop.lock().unwrap().audio.clone();
-                                    match audio::Recorder::start(&audio_cfg) {
-                                        Ok(r) => {
-                                            log::info!("Recording started");
-                                            *slot = Some(r);
-                                            *press_time_loop.lock().unwrap() =
-                                                Some(Instant::now());
-                                        }
-                                        Err(e) => {
-                                            log::error!("Failed to start recording: {e:#}")
-                                        }
-                                    }
-                                }
+                                log::info!("Press during in-flight transcription ignored");
                             } else if is_double_tap && currently_recording {
                                 // Classic in-recording cancel (rec still live).
                                 cancel_flag_loop.store(true, Ordering::SeqCst);
                                 let mut slot = recorder_loop.lock().unwrap();
                                 let dropped = slot.take().is_some();
                                 drop(slot);
+                                if let Some(capture) = streaming_capture.as_mut() {
+                                    capture.cancel();
+                                }
                                 if dropped {
                                     log::info!("Double-tap cancel: recording aborted");
                                 }
@@ -615,8 +806,7 @@ fn main() -> Result<()> {
                                 *flash_until_loop.lock().unwrap() =
                                     Some(Instant::now() + CANCEL_FLASH_DURATION);
                             } else {
-                                let mut slot = recorder_loop.lock().unwrap();
-                                if slot.is_none() {
+                                if recorder_loop.lock().unwrap().is_none() && streaming_capture.is_none() && !currently_in_flight {
                                     // New session — clear any stale cancel flag from a
                                     // prior aborted run, and snap the tray off any
                                     // leftover red flash so the icon goes straight
@@ -624,22 +814,61 @@ fn main() -> Result<()> {
                                     // shortly after a cancel.
                                     cancel_flag_loop.store(false, Ordering::SeqCst);
                                     *flash_until_loop.lock().unwrap() = None;
-                                    let audio_cfg = cfg_loop.lock().unwrap().audio.clone();
-                                    match audio::Recorder::start(&audio_cfg) {
-                                        Ok(r) => {
-                                            log::info!("Recording started");
-                                            *slot = Some(r);
-                                            *press_time_loop.lock().unwrap() =
-                                                Some(Instant::now());
+                                    let (audio_cfg, server_cfg, stt_cfg, backend) = {
+                                        let c = cfg_loop.lock().unwrap();
+                                        (c.audio.clone(), c.server.clone(), c.stt.clone(), c.server.backend)
+                                    };
+                                    if backend == BackendMode::Streaming {
+                                        match streaming::StreamingCapture::start(&audio_cfg, server_cfg, stt_cfg) {
+                                            Ok((capture, rx)) => {
+                                                log::info!("Streaming recording started");
+                                                streaming_capture = Some(capture);
+                                                streaming_events = Some(rx);
+                                                *press_time_loop.lock().unwrap() = Some(Instant::now());
+                                            }
+                                            Err(e) => log::error!("Failed to start streaming recording: {e:#}"),
                                         }
-                                        Err(e) => {
-                                            log::error!("Failed to start recording: {e:#}")
+                                    } else {
+                                        let mut slot = recorder_loop.lock().unwrap();
+                                        match audio::Recorder::start(&audio_cfg) {
+                                            Ok(r) => {
+                                                log::info!("Recording started");
+                                                *slot = Some(r);
+                                                *press_time_loop.lock().unwrap() = Some(Instant::now());
+                                            }
+                                            Err(e) => log::error!("Failed to start recording: {e:#}"),
                                         }
                                     }
                                 }
                             }
                         }
                         PushAction::Release => {
+                            let streaming_is_recording = streaming_capture
+                                .as_ref()
+                                .map(|capture| capture.is_recording())
+                                .unwrap_or(false);
+                            if streaming_capture.is_some() && !streaming_is_recording {
+                                // Error/Cancelled can terminate the worker
+                                // while the physical key is still held. A
+                                // later Release must not resurrect processing
+                                // for that terminal capture.
+                                *press_time_loop.lock().unwrap() = None;
+                                continue;
+                            }
+                            if let Some(capture) = streaming_capture.as_mut() {
+                                let duration = press_time_loop.lock().unwrap().take()
+                                    .map(|t| t.elapsed()).unwrap_or_default();
+                                if duration < Duration::from_millis(150) {
+                                    capture.cancel();
+                                    log::info!("Streaming recording too short ({}ms), discarded", duration.as_millis());
+                                } else {
+                                    capture.release();
+                                    in_flight_loop.store(true, Ordering::SeqCst);
+                                    log::info!("Streaming recording released; waiting for done");
+                                }
+                                *last_release_at_loop.lock().unwrap() = Some(Instant::now());
+                                continue;
+                            }
                             let rec = recorder_loop.lock().unwrap().take();
                             let started = press_time_loop.lock().unwrap().take();
                             // Remember this release so a follow-up quick
@@ -719,6 +948,9 @@ fn main() -> Result<()> {
                                         &vad_speech_active_loop,
                                     );
                                 } else {
+                                    if let Some(capture) = streaming_capture.as_mut() {
+                                        capture.cancel();
+                                    }
                                     binding_manager.disable();
                                     if let Some(s) = vad_session.take() {
                                         s.stop();
@@ -728,6 +960,9 @@ fn main() -> Result<()> {
                                     log::info!("Disabled: input path torn down");
                                 }
                             } else if outcome.input_mode_changed {
+                                if let Some(capture) = streaming_capture.as_mut() {
+                                    capture.cancel();
+                                }
                                 let snapshot = cfg_loop.lock().unwrap().clone();
                                 if snapshot.enabled {
                                     apply_input_mode(
@@ -915,6 +1150,28 @@ fn main() -> Result<()> {
     });
 }
 
+/// Deterministic UI-only diagnostic. It exercises the same recording,
+/// partial, processing, and hide transitions as a real session, without
+/// opening the microphone, contacting the STT server, or injecting text.
+fn run_overlay_preview() {
+    let overlay = overlay::Overlay::start();
+    for elapsed in 0..10 {
+        let partial = if elapsed >= 2 {
+            Some("这是实时转写预览，新增内容会显示在卡片下方。")
+        } else {
+            None
+        };
+        overlay.show_recording("F8", Duration::from_secs(elapsed), partial);
+        thread::sleep(Duration::from_secs(1));
+    }
+    overlay.show_partial("这是实时转写预览，新增内容会显示在卡片下方。");
+    thread::sleep(Duration::from_secs(5));
+    overlay.show_processing(Some("最终识别中，松开按键后只会写入一次。"));
+    thread::sleep(Duration::from_secs(3));
+    overlay.hide();
+    thread::sleep(Duration::from_millis(200));
+}
+
 /// Engage exactly one input path — either the global-hotkey / mouse-hook
 /// binding (push-to-talk) or the always-listening VAD session (voice
 /// activation). Tears down the other so their state machines can't race.
@@ -940,7 +1197,8 @@ fn apply_input_mode(
             if let Err(e) = binding_manager.apply(&binding) {
                 log::error!(
                     "Input mode → PTT: apply binding '{}' failed: {:#}",
-                    binding, e
+                    binding,
+                    e
                 );
             }
         }
@@ -953,13 +1211,13 @@ fn apply_input_mode(
             if let Err(e) = binding_manager.apply(&binding) {
                 log::warn!(
                     "VAD mode: could not bind cancel hotkey '{}': {:#}",
-                    binding, e
+                    binding,
+                    e
                 );
             }
             if vad_session.is_none() {
                 log::info!("Input mode → VAD: starting capture + VAD worker");
-                *vad_session =
-                    Some(audio::VadSession::start(cfg.audio.clone(), cfg.vad.clone()));
+                *vad_session = Some(audio::VadSession::start(cfg.audio.clone(), cfg.vad.clone()));
             }
         }
     }
@@ -967,10 +1225,7 @@ fn apply_input_mode(
 
 /// Compose (title, prompt, initial value) for the Win32 text-input popup
 /// based on which config field the user asked to edit.
-fn text_input_params(
-    field: tray::TextField,
-    cfg: &Arc<Mutex<Config>>,
-) -> (String, String, String) {
+fn text_input_params(field: tray::TextField, cfg: &Arc<Mutex<Config>>) -> (String, String, String) {
     let c = cfg.lock().unwrap();
     match field {
         tray::TextField::LanguageHint => (
@@ -991,8 +1246,7 @@ fn text_input_params(
         ),
         tray::TextField::ServerKey => (
             "vibe-dictate — API key".to_string(),
-            "Bearer token for the STT server (leave empty for local http://localhost):"
-                .to_string(),
+            "Bearer token for the STT server (leave empty for local http://localhost):".to_string(),
             c.server.api_key.clone(),
         ),
         tray::TextField::ServerModel => (
@@ -1081,11 +1335,7 @@ fn send_and_inject(
             return Ok(());
         }
     };
-    let text = match client.transcribe(
-        wav,
-        &stt_cfg.language_hint,
-        &stt_cfg.context_info,
-    ) {
+    let text = match client.transcribe(wav, &stt_cfg.language_hint, &stt_cfg.context_info) {
         Ok(t) => {
             connection_ok.store(true, Ordering::SeqCst);
             t
@@ -1175,6 +1425,63 @@ fn send_and_inject(
     // Successful end-to-end — clear any stale error note so the tooltip
     // doesn't keep showing last run's problem after it was fixed.
     *last_error_note.lock().unwrap() = None;
+    Ok(())
+}
+
+fn streaming_send_and_inject(
+    result: streaming::StreamResult,
+    cfg: Arc<Mutex<Config>>,
+    connection_ok: Arc<AtomicBool>,
+    flash_error_until: Arc<Mutex<Option<Instant>>>,
+    last_error_note: Arc<Mutex<Option<(Instant, String)>>>,
+    in_flight: Arc<AtomicBool>,
+    run_cancel: Arc<AtomicBool>,
+) -> Result<()> {
+    if run_cancel.load(Ordering::Acquire) {
+        in_flight.store(false, Ordering::SeqCst);
+        return Ok(());
+    }
+    let output_cfg = cfg.lock().unwrap().output.clone();
+    let raw = result.clean_text.unwrap_or(result.text).trim().to_string();
+    if raw.is_empty() {
+        log::warn!("Empty streaming transcription returned");
+        in_flight.store(false, Ordering::SeqCst);
+        return Ok(());
+    }
+    let mut out = raw;
+    if output_cfg.trailing_space {
+        out.push(' ');
+    }
+    if run_cancel.load(Ordering::Acquire) {
+        in_flight.store(false, Ordering::SeqCst);
+        return Ok(());
+    }
+    let injection = match output_cfg.mode {
+        OutputMode::Clipboard => injector::clipboard_paste(&out),
+        OutputMode::Sendinput => injector::send_input_text(
+            &out,
+            output_cfg.send_key_delay_ms,
+            output_cfg.send_key_down_delay_ms,
+        ),
+    };
+    if let Err(e) = injection {
+        let summary = format!("Streaming output failed: {e:#}");
+        report_pipeline_error(&summary, false, &flash_error_until, &last_error_note);
+        in_flight.store(false, Ordering::SeqCst);
+        return Err(e);
+    }
+    if output_cfg.send_enter {
+        if let Err(e) = injector::send_enter() {
+            let summary = format!("Streaming Enter failed: {e:#}");
+            report_pipeline_error(&summary, false, &flash_error_until, &last_error_note);
+            in_flight.store(false, Ordering::SeqCst);
+            return Err(e);
+        }
+    }
+    connection_ok.store(true, Ordering::SeqCst);
+    *last_error_note.lock().unwrap() = None;
+    in_flight.store(false, Ordering::SeqCst);
+    log::info!("Streaming transcription injected ({} chars)", out.len());
     Ok(())
 }
 
@@ -1272,7 +1579,10 @@ fn init_logger() {
                 builder.target(env_logger::Target::Pipe(Box::new(f)));
             }
             Err(e) => {
-                eprintln!("vibe-dictate: cannot open log file {}: {e:#}", path.display());
+                eprintln!(
+                    "vibe-dictate: cannot open log file {}: {e:#}",
+                    path.display()
+                );
             }
         }
     }
@@ -1294,9 +1604,10 @@ fn parse_hotkey(s: &str) -> Result<HotKey> {
             "rightalt" | "altgr" => mods |= Modifiers::ALT_GRAPH,
             "win" | "super" | "meta" => mods |= Modifiers::META,
             other => {
-                code = Some(parse_code(other).ok_or_else(|| {
-                    anyhow!("unknown key token '{}' in hotkey '{}'", other, s)
-                })?);
+                code =
+                    Some(parse_code(other).ok_or_else(|| {
+                        anyhow!("unknown key token '{}' in hotkey '{}'", other, s)
+                    })?);
             }
         }
     }

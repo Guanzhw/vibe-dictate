@@ -1,4 +1,16 @@
-# vibe-dictate
+# VibeVoice 语音输入 · 个人定制版
+
+基于 [chestercs/vibe-dictate](https://github.com/chestercs/vibe-dictate) 维护的 Windows 语音输入客户端，使用 **VibeVoice-ASR-Streaming-1.5B** 和本地 NVIDIA GPU 推理。
+
+- 按住 **F8** 说话，浮窗显示红色录音提示、计时和实时转写；松开后将完整文字写入当前输入框。
+- Windows 原生 Rust 客户端负责托盘、全局快捷键、WASAPI 录音和文字输入；Ubuntu WSL2 运行模型，通过本地 WebSocket 传输音频。
+- 安装脚本创建“VibeVoice 语音输入”快捷方式；启动器按需启动模型，退出时停止自己启动的服务。
+
+这是为当前使用环境维护的定制版本。安装预设使用 Ubuntu、WSL 用户 `qq110`、中文优先转写和 F8；更换机器时请按文档调整脚本参数。模型约每 2.93 秒处理一块音频，首段文字需要先积累约 3.47 秒音频。
+
+参见 [安装与使用](docs/windows-streaming.md) 和 [实际验证记录](docs/windows-streaming-validation.md)。原项目历史及功能说明保留如下。
+
+## Original vibe-dictate documentation
 
 ![vibe-dictate tray menu](assets/tray-menu.png)
 
